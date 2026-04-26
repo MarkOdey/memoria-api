@@ -1,9 +1,10 @@
-const Anthropic = require('@anthropic-ai/sdk');
+const { Ollama } = require('ollama');
 const Subject = require('../models/Subject');
 const Question = require('../models/Question');
 const Answer = require('../models/Answer');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const ollama = new Ollama({ host: process.env.OLLAMA_HOST || 'http://localhost:11434' });
+const MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
 
 const ALL_TOPICS = [
   'childhood', 'family', 'education', 'career',
@@ -16,9 +17,7 @@ async function getAnswersByTopic(subjectId) {
   for (const topic of ALL_TOPICS) byTopic[topic] = [];
   for (const answer of answers) {
     const topic = answer.questionId?.topic;
-    if (topic && byTopic[topic]) {
-      byTopic[topic].push(answer.text);
-    }
+    if (topic && byTopic[topic]) byTopic[topic].push(answer.text);
   }
   return byTopic;
 }
@@ -35,6 +34,25 @@ function identifyThinTopics(byTopic) {
   return ALL_TOPICS.filter((t) => byTopic[t].length < 2);
 }
 
+function extractJsonArray(raw) {
+  // Try direct parse first
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    // Some models wrap in { questions: [...] } or similar
+    const first = Object.values(parsed).find(Array.isArray);
+    if (first) return first;
+  } catch (_) {}
+
+  // Fall back to regex extraction
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (match) {
+    try { return JSON.parse(match[0]); } catch (_) {}
+  }
+
+  return null;
+}
+
 async function generateQuestions(subjectId) {
   const subject = await Subject.findById(subjectId);
   if (!subject) throw new Error('Subject not found');
@@ -42,7 +60,6 @@ async function generateQuestions(subjectId) {
   const byTopic = await getAnswersByTopic(subjectId);
   const thinTopics = identifyThinTopics(byTopic);
 
-  // Fetch existing question texts to avoid duplicates
   const existing = await Question.find({ subjectId }).select('text');
   const existingTexts = new Set(existing.map((q) => q.text.toLowerCase()));
 
@@ -54,21 +71,20 @@ ${formatAnswersForPrompt(byTopic)}
 The following topics need more depth: ${thinTopics.join(', ')}
 
 Generate 5 clarifying questions to fill the most important gaps.
-Return ONLY valid JSON array: [{ "topic": "<topic>", "question": "<question text>", "why": "<brief reason>" }]`;
+Return ONLY a JSON array with no extra text, using this exact structure:
+[{"topic":"<one of: ${ALL_TOPICS.join('|')}>","question":"<question text>","why":"<brief reason>"}]`;
 
-  const message = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 1024,
+  const response = await ollama.chat({
+    model: MODEL,
+    format: 'json',
     messages: [{ role: 'user', content: prompt }],
+    options: { temperature: 0.7 },
   });
 
-  const raw = message.content[0].text.trim();
+  const raw = response.message.content.trim();
+  const parsed = extractJsonArray(raw);
 
-  // Extract JSON array even if Claude adds surrounding text
-  const match = raw.match(/\[[\s\S]*\]/);
-  if (!match) throw new Error('Claude did not return a JSON array');
-
-  const parsed = JSON.parse(match[0]);
+  if (!parsed) throw new Error(`Could not parse JSON from model response:\n${raw}`);
 
   const toInsert = parsed.filter(
     (item) =>
@@ -102,19 +118,19 @@ async function synthesizeStory(subjectId) {
     return `No answers have been recorded yet for ${subject.name}. Complete some interview questions first.`;
   }
 
-  const prompt = `You are a biographer. Based on the following interview answers about ${subject.name}, write a warm, flowing biographical narrative in third person. Organize it chronologically. Here are the answers by topic:
+  const prompt = `You are a biographer. Based on the following interview answers about ${subject.name}, write a warm, flowing biographical narrative in third person. Organize it chronologically. Do not include section headers — write it as flowing prose.
 
-${formatAnswersForPrompt(byTopic)}
+Here are the answers by topic:
 
-Write a cohesive biographical narrative. Do not include section headers — write it as flowing prose.`;
+${formatAnswersForPrompt(byTopic)}`;
 
-  const message = await client.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 4096,
+  const response = await ollama.chat({
+    model: MODEL,
     messages: [{ role: 'user', content: prompt }],
+    options: { temperature: 0.8 },
   });
 
-  return message.content[0].text.trim();
+  return response.message.content.trim();
 }
 
 module.exports = { generateQuestions, synthesizeStory };
