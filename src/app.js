@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 
+const { seedPremadeQuestions } = require('./seed');
 const subjectsRouter = require('./routes/subjects');
 const questionsRouter = require('./routes/questions');
 const answersRouter = require('./routes/answers');
@@ -24,8 +25,9 @@ const PORT = process.env.PORT || 3300;
 
 mongoose
   .connect(process.env.MONGODB_URI)
-  .then(() => {
+  .then(async () => {
     console.log('Connected to MongoDB');
+    await seedPremadeQuestions();
     app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
   })
   .catch((err) => {
